@@ -14,8 +14,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # --- application source ----------------------------------------------------
-COPY inference.py openenv.yaml ./
-COPY env/ ./env/
+COPY models.py tasks.py env.py inference.py app.py openenv.yaml ./
 
 # --- runtime environment variables (override at docker run) ----------------
 ENV API_BASE_URL=""
@@ -25,4 +24,8 @@ ENV HF_TOKEN=""
 # --- OpenEnv validator entry point -----------------------------------------
 # The validator calls:  docker run <image>
 # inference.py writes the required [START]/[STEP]/[END] lines to stdout.
-CMD ["python", "inference.py"]
+# Expose the OpenEnv API port
+EXPOSE 7860
+
+# Start the FastAPI server on 0.0.0.0:7860 (Hugging Face Spaces default port)
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]

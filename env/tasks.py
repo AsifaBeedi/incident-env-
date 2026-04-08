@@ -70,7 +70,8 @@ def reward_engine(
         + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus,
         4,
     )
-    rb.final = round(max(0.0, min(1.0, rb.raw)), 4)
+    # Clamp to (0.0, 1.0) strictly - validation requires scores between 0 and 1, not including boundaries
+    rb.final = round(max(0.001, min(0.999, rb.raw)), 4)
     return rb
 
 

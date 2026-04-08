@@ -1,0 +1,17 @@
+[project]
+name = "incident-response-env"
+version = "0.1.0"
+description = "OpenEnv-compatible incident response environment"
+authors = [
+    { name = "Asifa" }
+]
+requires-python = ">=3.10"
+
+dependencies = [
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+]
+
+[tool.setuptools]
+packages = ["env"]

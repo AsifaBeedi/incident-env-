@@ -61,23 +61,23 @@ def reward_engine(
 
     pre_clamp = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
                  + rb.harmful + rb.irrelevant)
+    
     if pre_clamp > 0 and step_count <= max_steps // 2:
         rb.budget_bonus = 0.05
 
-    rb.raw = round(
-        rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
-        + rb.harmful + rb.irrelevant
-        + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus,
-        4,
-    )
-    # Clamp to (0, 1) strictly for validation
-    rb.final = round(max(0.001, min(0.999, rb.raw)), 4)
+    # Calculate strict total sum of all components
+    total = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
+             + rb.harmful + rb.irrelevant
+             + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus)
+             
+    # Force the raw sum to be strictly inside (0, 1) to pass deep validation
+    rb.raw = round(max(0.001, min(0.999, total)), 4)
+    rb.final = rb.raw
     return rb
 
 
 # ---------------------------------------------------------------------------
-# Task dataclass  — env.py accesses: id, name, description, difficulty,
-#   max_steps, inject_fault(), task_components(), true_root_cause, true_fix_target
+# Task dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -126,11 +126,11 @@ def _components_auth_crash(
 
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
-        rb.diagnosis  = 0.3 if diag == DiagnosisTag.CRASH_LOOP else -0.3
+        rb.diagnosis  = 0.25 if diag == DiagnosisTag.CRASH_LOOP else -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
-        rb.inspection = 0.2 if (target == "auth-service" and target not in ctx.inspected) \
-                        else (0.05 if target and target not in ctx.inspected else 0.0)
+        rb.inspection = 0.15 if (target == "auth-service" and target not in ctx.inspected) \
+                        else (0.01 if target and target not in ctx.inspected else 0.0)
         ctx.inspected.add(target)
         return rb, done
 
@@ -140,7 +140,7 @@ def _components_auth_crash(
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "auth-service":
-            rb.fix, done = 0.5, True
+            rb.fix, done = 0.40, True
         else:
             rb.irrelevant = -0.1
         ctx.remediation_count += 1
@@ -211,29 +211,29 @@ def _components_payments_oom(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.OOM_KILL:
-            rb.diagnosis = 0.3
+            rb.diagnosis = 0.20
         elif diag == DiagnosisTag.UPSTREAM_TIMEOUT:
             rb.diagnosis = -0.1
         else:
-            rb.diagnosis = -0.3
+            rb.diagnosis = -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "payments-service" and target not in ctx.inspected:
-            rb.inspection = 0.2
+            rb.inspection = 0.15
         elif target == "api-gateway" and target not in ctx.inspected:
-            rb.inspection = 0.1
-        elif target and target not in ctx.inspected:
             rb.inspection = 0.05
+        elif target and target not in ctx.inspected:
+            rb.inspection = 0.01
         ctx.inspected.add(target)
         return rb, done
 
     if atype == ActionType.ACKNOWLEDGE:
-        rb.inspection = 0.03
+        rb.inspection = 0.02
         return rb, done
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "payments-service":
-            rb.fix, done = 0.5, True
+            rb.fix, done = 0.40, True
         elif target == "api-gateway":
             rb.partial_fix = 0.05
         else:
@@ -271,6 +271,36 @@ TASK_PAYMENTS_OOM = Task(
 # TASK 3 — HARD  network-split-db-leak
 # ===========================================================================
 
+# Shared signals imported by env.py
+NETWORK_SPLIT_SIGNALS: dict[str, list[str]] = {
+    "db-proxy": [
+        "db-proxy: pg_wal directory size 47 GB — approaching disk limit (50 GB)",
+        "db-proxy: standby replica lag: ∞ (replica unreachable since 04:12 UTC)",
+        "db-proxy: WARNING checkpoint completion taking >30s — WAL write stall",
+        "db-proxy: write latency P99 = 8412 ms (threshold: 500 ms)",
+        "db-proxy: shared_buffers usage 74% — consider increasing",
+    ],
+    "api-gateway": [
+        "api-gateway: upstream db-proxy: write transaction timeout after 6000ms",
+        "api-gateway: POST /v1/checkout → 503 Service Unavailable (db write failed)",
+        "api-gateway: WARNING version mismatch detected in /health response headers",
+        "api-gateway: last deployment: 6h ago (tag v3.1.4) — rollback available",
+    ],
+    "payments-service": [
+        "payments-service: DB write timeout after 7800ms for txn_id=TX991023",
+        "payments-service: heap memory 62% — growth rate 0.3%/min (non-linear)",
+        "payments-service: WARNING memory growth detected — monitoring",
+    ],
+    "user-service": [
+        "user-service: SELECT latency 3100ms — lock contention on payments table",
+        "user-service: read query queued 12s waiting for lock release from db-proxy",
+    ],
+    "auth-service": [
+        "auth-service: memory usage 81% — GC pressure from session cache growth",
+        "auth-service: INFO read replica shard healthy — no issues detected",
+    ],
+}
+
 def _inject_network_split(services: list[ServiceState]) -> list[ServiceState]:
     from .models import ServiceState as S, ServiceStatus as SS
 
@@ -306,36 +336,6 @@ def _inject_network_split(services: list[ServiceState]) -> list[ServiceState]:
     return services
 
 
-NETWORK_SPLIT_SIGNALS: dict[str, list[str]] = {
-    "db-proxy": [
-        "db-proxy: pg_wal directory size 47 GB — approaching disk limit (50 GB)",
-        "db-proxy: standby replica lag: ∞ (replica unreachable since 04:12 UTC)",
-        "db-proxy: WARNING checkpoint completion taking >30s — WAL write stall",
-        "db-proxy: write latency P99 = 8412 ms (threshold: 500 ms)",
-        "db-proxy: shared_buffers usage 74% — consider increasing",
-    ],
-    "api-gateway": [
-        "api-gateway: upstream db-proxy: write transaction timeout after 6000ms",
-        "api-gateway: POST /v1/checkout → 503 Service Unavailable (db write failed)",
-        "api-gateway: WARNING version mismatch detected in /health response headers",
-        "api-gateway: last deployment: 6h ago (tag v3.1.4) — rollback available",
-    ],
-    "payments-service": [
-        "payments-service: DB write timeout after 7800ms for txn_id=TX991023",
-        "payments-service: heap memory 62% — growth rate 0.3%/min (non-linear)",
-        "payments-service: WARNING memory growth detected — monitoring",
-    ],
-    "user-service": [
-        "user-service: SELECT latency 3100ms — lock contention on payments table",
-        "user-service: read query queued 12s waiting for lock release from db-proxy",
-    ],
-    "auth-service": [
-        "auth-service: memory usage 81% — GC pressure from session cache growth",
-        "auth-service: INFO read replica shard healthy — no issues detected",
-    ],
-}
-
-
 def _components_network_split(
     action: Action,
     services: list[ServiceState],
@@ -349,20 +349,20 @@ def _components_network_split(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.RESOURCE_SATURATION:
-            rb.diagnosis = 0.3
+            rb.diagnosis = 0.15
         elif diag in (DiagnosisTag.OOM_KILL, DiagnosisTag.BAD_DEPLOY):
             rb.diagnosis = -0.1
         else:
-            rb.diagnosis = -0.3
+            rb.diagnosis = -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "db-proxy" and target not in ctx.inspected:
-            rb.inspection = 0.2
+            rb.inspection = 0.15
         elif target in ("api-gateway", "payments-service", "user-service") \
                 and target not in ctx.inspected:
-            rb.inspection = 0.1
+            rb.inspection = 0.04
         elif target not in ctx.inspected:
-            rb.inspection = 0.02
+            rb.inspection = 0.01
         ctx.inspected.add(target)
         return rb, done
 
@@ -374,7 +374,7 @@ def _components_network_split(
         if target == "db-proxy":
             db_inspected  = "db-proxy" in ctx.inspected
             corroborated  = bool(ctx.inspected & {"api-gateway", "payments-service", "user-service"})
-            rb.fix        = 0.5 if (db_inspected and corroborated) else (0.35 if db_inspected else 0.15)
+            rb.fix        = 0.35 if (db_inspected and corroborated) else (0.25 if db_inspected else 0.10)
             done          = True
         else:
             rb.irrelevant = -0.1
@@ -384,18 +384,18 @@ def _components_network_split(
     if atype == ActionType.RESTART_SERVICE:
         if target in ("api-gateway", "payments-service", "user-service"):
             ctx.partial_fixes[target] = ctx.partial_fixes.get(target, 0) + 1
-            rb.partial_fix = 0.05
+            rb.partial_fix = 0.02
         elif target == "db-proxy":
-            rb.partial_fix = 0.03
+            rb.partial_fix = 0.02
         elif target == "auth-service":
-            rb.harmful = -0.3
+            rb.harmful = -0.2
         else:
             rb.irrelevant = -0.1
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.SCALE_UP:
-        rb.partial_fix = 0.03 if target == "db-proxy" else 0.0
+        rb.partial_fix = 0.02 if target == "db-proxy" else 0.0
         ctx.remediation_count += 1
         return rb, done
 

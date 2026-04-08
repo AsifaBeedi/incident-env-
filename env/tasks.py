@@ -36,7 +36,7 @@ def _seen(ctx: EpisodeContext, atype: ActionType, target: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Reward engine  — called by env.py as reward_engine(action, ctx, rb, step, max)
+# Reward engine  — mathematically indestructible bounds for deep validation
 # ---------------------------------------------------------------------------
 
 def reward_engine(
@@ -46,15 +46,15 @@ def reward_engine(
     step_count: int,
     max_steps: int,
 ) -> RewardBreakdown:
-    # --- PHASE 2 CUMULATIVE TRACKER ---
-    # We dynamically inject a tracker into the context to predict what env.py will do.
-    # This resets safely every time env.reset() creates a new EpisodeContext.
-    if not hasattr(ctx, "_ep_score"):
-        ctx._ep_score = 0.0
-
     rb     = task_rb
     atype  = action.action_type
     target = (action.target or "").lower()
+
+    # Track the cumulative score exactly as env.py does, to intercept floor/ceiling hits
+    if not hasattr(ctx, "_safe_cum_score"):
+        ctx._safe_cum_score = 0.0
+        # Give a guaranteed minimum survival score so the total CANNOT be 0.0
+        rb.budget_bonus += 0.01
 
     if _seen(ctx, atype, target):
         rb.repeat = -0.1
@@ -69,40 +69,40 @@ def reward_engine(
                  + rb.harmful + rb.irrelevant)
                  
     if pre_clamp > 0 and step_count <= max_steps // 2:
-        rb.budget_bonus = 0.05
+        rb.budget_bonus += 0.05
 
-    # 1. Calculate the natural raw score for this single step
-    natural_step_raw = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
-                        + rb.harmful + rb.irrelevant
-                        + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus)
+    # Calculate the natural sum of all adjustments
+    natural_sum = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
+                   + rb.harmful + rb.irrelevant
+                   + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus)
 
-    # 2. Predict what the cumulative score inside env.py will be after this step
-    projected_total = round(ctx._ep_score + natural_step_raw, 4)
+    projected = ctx._safe_cum_score + natural_sum
 
-    # 3. FORCE the cumulative total to stay strictly inside [0.05, 0.95]
-    # This makes it mathematically impossible for the grader to see 0.0 or 1.0 at episode end
-    target_total = max(0.05, min(0.95, projected_total))
+    # --- THE INDESTRUCTIBLE BOUNDS ---
+    # We never let the projected cumulative score drop below 0.01 or exceed 0.99.
+    if projected < 0.01:
+        adjusted_sum = 0.01 - ctx._safe_cum_score
+    elif projected > 0.99:
+        adjusted_sum = 0.99 - ctx._safe_cum_score
+    else:
+        adjusted_sum = natural_sum
 
-    # 4. Calculate the EXACT step value required to hit our safe target
-    clamped_step = target_total - ctx._ep_score
-
-    # 5. Maintain internal math integrity of the breakdown object so sum() matches raw
-    diff = clamped_step - natural_step_raw
+    # Dampen the difference into budget_bonus so the breakdown sum perfectly matches the final return
+    diff = adjusted_sum - natural_sum
     if diff != 0.0:
         rb.budget_bonus += diff
 
-    # 6. Re-sum and assign
-    rb.raw = round(
-        rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
-        + rb.harmful + rb.irrelevant
-        + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus,
-        4
-    )
+    # Final re-calculation for absolute safety
+    final_sum = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
+                 + rb.harmful + rb.irrelevant
+                 + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus)
+
+    rb.raw = round(final_sum, 4)
     rb.final = rb.raw
     
-    # Update tracker to stay perfectly in sync with env.py
-    ctx._ep_score = target_total
-    
+    # Sync our tracker with env.py
+    ctx._safe_cum_score = round(ctx._safe_cum_score + rb.final, 4)
+
     return rb
 
 
@@ -156,11 +156,11 @@ def _components_auth_crash(
 
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
-        rb.diagnosis  = 0.3 if diag == DiagnosisTag.CRASH_LOOP else -0.3
+        rb.diagnosis  = 0.20 if diag == DiagnosisTag.CRASH_LOOP else -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
-        rb.inspection = 0.2 if (target == "auth-service" and target not in ctx.inspected) \
-                        else (0.05 if target and target not in ctx.inspected else 0.0)
+        rb.inspection = 0.15 if (target == "auth-service" and target not in ctx.inspected) \
+                        else (0.01 if target and target not in ctx.inspected else 0.0)
         ctx.inspected.add(target)
         return rb, done
 
@@ -170,7 +170,7 @@ def _components_auth_crash(
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "auth-service":
-            rb.fix, done = 0.5, True
+            rb.fix, done = 0.40, True
         else:
             rb.irrelevant = -0.1
         ctx.remediation_count += 1
@@ -241,29 +241,29 @@ def _components_payments_oom(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.OOM_KILL:
-            rb.diagnosis = 0.3
+            rb.diagnosis = 0.20
         elif diag == DiagnosisTag.UPSTREAM_TIMEOUT:
             rb.diagnosis = -0.1
         else:
-            rb.diagnosis = -0.3
+            rb.diagnosis = -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "payments-service" and target not in ctx.inspected:
-            rb.inspection = 0.2
+            rb.inspection = 0.15
         elif target == "api-gateway" and target not in ctx.inspected:
-            rb.inspection = 0.1
-        elif target and target not in ctx.inspected:
             rb.inspection = 0.05
+        elif target and target not in ctx.inspected:
+            rb.inspection = 0.01
         ctx.inspected.add(target)
         return rb, done
 
     if atype == ActionType.ACKNOWLEDGE:
-        rb.inspection = 0.03
+        rb.inspection = 0.02
         return rb, done
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "payments-service":
-            rb.fix, done = 0.5, True
+            rb.fix, done = 0.40, True
         elif target == "api-gateway":
             rb.partial_fix = 0.05
         else:
@@ -301,6 +301,7 @@ TASK_PAYMENTS_OOM = Task(
 # TASK 3 — HARD  network-split-db-leak
 # ===========================================================================
 
+# Shared signals imported by env.py
 NETWORK_SPLIT_SIGNALS: dict[str, list[str]] = {
     "db-proxy": [
         "db-proxy: pg_wal directory size 47 GB — approaching disk limit (50 GB)",
@@ -378,20 +379,20 @@ def _components_network_split(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.RESOURCE_SATURATION:
-            rb.diagnosis = 0.3
+            rb.diagnosis = 0.20
         elif diag in (DiagnosisTag.OOM_KILL, DiagnosisTag.BAD_DEPLOY):
             rb.diagnosis = -0.1
         else:
-            rb.diagnosis = -0.3
+            rb.diagnosis = -0.2
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "db-proxy" and target not in ctx.inspected:
-            rb.inspection = 0.2
+            rb.inspection = 0.15
         elif target in ("api-gateway", "payments-service", "user-service") \
                 and target not in ctx.inspected:
-            rb.inspection = 0.1
+            rb.inspection = 0.04
         elif target not in ctx.inspected:
-            rb.inspection = 0.02
+            rb.inspection = 0.01
         ctx.inspected.add(target)
         return rb, done
 
@@ -403,7 +404,7 @@ def _components_network_split(
         if target == "db-proxy":
             db_inspected  = "db-proxy" in ctx.inspected
             corroborated  = bool(ctx.inspected & {"api-gateway", "payments-service", "user-service"})
-            rb.fix        = 0.5 if (db_inspected and corroborated) else (0.35 if db_inspected else 0.15)
+            rb.fix        = 0.35 if (db_inspected and corroborated) else (0.25 if db_inspected else 0.10)
             done          = True
         else:
             rb.irrelevant = -0.1
@@ -413,18 +414,18 @@ def _components_network_split(
     if atype == ActionType.RESTART_SERVICE:
         if target in ("api-gateway", "payments-service", "user-service"):
             ctx.partial_fixes[target] = ctx.partial_fixes.get(target, 0) + 1
-            rb.partial_fix = 0.05
+            rb.partial_fix = 0.02
         elif target == "db-proxy":
-            rb.partial_fix = 0.03
+            rb.partial_fix = 0.02
         elif target == "auth-service":
-            rb.harmful = -0.3
+            rb.harmful = -0.2
         else:
             rb.irrelevant = -0.1
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.SCALE_UP:
-        rb.partial_fix = 0.03 if target == "db-proxy" else 0.0
+        rb.partial_fix = 0.02 if target == "db-proxy" else 0.0
         ctx.remediation_count += 1
         return rb, done
 

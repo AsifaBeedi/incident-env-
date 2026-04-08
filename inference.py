@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any
 
 from openai import OpenAI
@@ -79,7 +80,6 @@ def _call_model(messages):
     atype = data.get("action_type")
     target = data.get("target")
 
-    # 🔥 HARD GUARDRAILS
     if atype not in _VALID_ACTION_TYPES:
         return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), "invalid_action"
 
@@ -109,10 +109,19 @@ def _run_episode(task_id) -> bool:
     messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
     max_steps = 6
 
+    seen_actions = set()
+
     for _ in range(max_steps):
         messages.append({"role": "user", "content": _obs_to_text(obs)})
 
         action, error = _call_model(messages)
+
+        # 🔥 PREVENT REPEATED ACTIONS
+        action_key = (action.action_type.value, action.target)
+        if action_key in seen_actions:
+            action = Action(action_type=ActionType.NO_OP, target=action.target)
+        else:
+            seen_actions.add(action_key)
 
         obs, reward, done, info = env.step(action)
 
@@ -161,6 +170,10 @@ def main():
         failed = _run_episode(task["id"])
         if failed:
             break
+
+    # 🔥 KEEP SPACE ALIVE (fix runtime error)
+    while True:
+        time.sleep(60)
 
 if __name__ == "__main__":
     main()

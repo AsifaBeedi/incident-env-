@@ -9,9 +9,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# ✅ KEEP FOLDER STRUCTURE
 COPY env/ ./env/
-COPY inference.py app.py openenv.yaml ./
+COPY inference.py openenv.yaml ./
+COPY server/ ./server/
 
 ENV API_BASE_URL=""
 ENV MODEL_NAME=""
@@ -19,4 +19,4 @@ ENV HF_TOKEN=""
 
 EXPOSE 7860
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "7860"]
+CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]

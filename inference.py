@@ -2,19 +2,21 @@ from __future__ import annotations
 
 import json
 import os
-import time
 from typing import Any
 
 from openai import OpenAI
-from env import IncidentResponseEnv, Action, ActionType, DiagnosisTag, list_tasks
+
+from env    import IncidentResponseEnv
+from models import Action, ActionType, DiagnosisTag   # correct source
+from tasks  import list_tasks                          # correct source
 
 # ---------------- CONFIG ----------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1").strip()
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct").strip()
-HF_TOKEN     = os.getenv("HF_TOKEN", "").strip()
+MODEL_NAME   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-7B-Instruct").strip()
+HF_TOKEN     = os.getenv("HF_TOKEN",     "").strip()
 
 ENV_NAME = "IncidentResponseEnv"
-SEED = 42
+SEED     = 42
 
 _CLIENT = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
@@ -23,23 +25,15 @@ _VALID_ACTION_TYPES = [a.value for a in ActionType]
 _VALID_DIAGNOSES    = [d.value for d in DiagnosisTag]
 
 # ---------------- PROMPT ----------------
-_SYSTEM_PROMPT = f"""
-You are an expert SRE handling incidents.
-
-Available action_type:
-{json.dumps(_VALID_ACTION_TYPES)}
-
-Available diagnosis:
-{json.dumps(_VALID_DIAGNOSES)}
-
+_SYSTEM_PROMPT = f"""You are an expert SRE handling incidents.
+Available action_type: {json.dumps(_VALID_ACTION_TYPES)}
+Available diagnosis: {json.dumps(_VALID_DIAGNOSES)}
 Rules:
 - ALWAYS include both action_type and target
-- Inspect → Diagnose → Fix
-- Never repeat actions
-- Never fix without diagnosis
-
-Return ONLY JSON.
-"""
+- Inspect first, then diagnose, then fix
+- Never repeat the same (action_type, target) pair
+- Never fix without a prior diagnosis
+Return ONLY a JSON object."""
 
 # ---------------- OBS ----------------
 def _obs_to_text(obs: Any) -> str:
@@ -47,20 +41,21 @@ def _obs_to_text(obs: Any) -> str:
         "step": obs.step,
         "services": [
             {
-                "name": s.name,
+                "name":   s.name,
                 "status": s.status.value,
-                "cpu": s.metrics.cpu_usage,
-                "mem": s.metrics.memory_usage,
-                "error": s.metrics.error_rate,
+                "cpu":    s.metrics.cpu_usage,
+                "mem":    s.metrics.memory_usage,
+                "error":  s.metrics.error_rate,
             }
             for s in obs.services
         ],
-        "logs": [f"{e.service}: {e.message}" for e in obs.logs],
+        "logs":    [f"{e.service}: {e.message}" for e in obs.logs],
+        "alerts":  obs.active_alerts,
     }
     return json.dumps(payload)
 
 # ---------------- MODEL ----------------
-def _call_model(messages):
+def _call_model(messages: list[dict]) -> tuple[Action, str | None]:
     try:
         res = _CLIENT.chat.completions.create(
             model=MODEL_NAME,
@@ -69,111 +64,101 @@ def _call_model(messages):
             max_tokens=200,
         )
         raw = res.choices[0].message.content.strip()
-    except Exception as e:
-        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), str(e)
+    except Exception as exc:
+        return Action(action_type=ActionType.NO_OP, target=None), str(exc)
+
+    if raw.startswith("```"):
+        raw = "\n".join(l for l in raw.splitlines() if not l.startswith("```")).strip()
 
     try:
         data = json.loads(raw)
-    except:
-        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), "json_error"
+    except Exception:
+        return Action(action_type=ActionType.NO_OP, target=None), "json_error"
 
-    atype = data.get("action_type")
-    target = data.get("target")
-
-    if atype not in _VALID_ACTION_TYPES:
-        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), "invalid_action"
-
-    if not target or not isinstance(target, str):
-        target = "auth-service"
-
+    atype  = data.get("action_type", "")
+    target = data.get("target") or None
     params = data.get("parameters", {}) or {}
 
-    return Action(
-        action_type=ActionType(atype),
-        target=target,
-        parameters=params,
-    ), None
+    if atype not in _VALID_ACTION_TYPES:
+        return Action(action_type=ActionType.NO_OP, target=None), f"invalid_action: {atype!r}"
+
+    diag = params.get("diagnosis")
+    if diag is not None and diag not in _VALID_DIAGNOSES:
+        params.pop("diagnosis")
+
+    return Action(action_type=ActionType(atype), target=target, parameters=params), None
 
 # ---------------- EPISODE ----------------
-def _run_episode(task_id) -> bool:
+def _run_episode(task_id: str) -> None:
     print(f"[START] task={task_id} env={ENV_NAME} model={MODEL_NAME}", flush=True)
 
-    env = IncidentResponseEnv(task_id=task_id, seed=SEED)
-    obs = env.reset()
+    rewards:      list[float] = []
+    step:         int         = 0
+    solved:       bool        = False
+    seen_actions: set         = set()
 
-    rewards = []
-    step = 0
-    solved = False
-    api_failed = False
+    try:
+        task_meta = next(t for t in list_tasks() if t["id"] == task_id)
+        max_steps = task_meta["max_steps"]          # respect each task's budget
 
-    messages = [{"role": "system", "content": _SYSTEM_PROMPT}]
-    max_steps = 6
+        env = IncidentResponseEnv(task_id=task_id, seed=SEED)
+        obs = env.reset()
+        messages: list[dict] = [{"role": "system", "content": _SYSTEM_PROMPT}]
 
-    seen_actions = set()
+        for _ in range(max_steps):
+            messages.append({"role": "user", "content": _obs_to_text(obs)})
+            action, error = _call_model(messages)
 
-    for _ in range(max_steps):
-        messages.append({"role": "user", "content": _obs_to_text(obs)})
+            # Deduplicate without hardcoding a fallback service
+            action_key = (action.action_type.value, action.target)
+            if action_key in seen_actions:
+                action = Action(action_type=ActionType.NO_OP, target=action.target)
+            else:
+                seen_actions.add(action_key)
 
-        action, error = _call_model(messages)
+            obs, reward, done, info = env.step(action)
+            step    += 1
+            rewards.append(reward)
 
-        # 🔥 PREVENT REPEATED ACTIONS
-        action_key = (action.action_type.value, action.target)
-        if action_key in seen_actions:
-            action = Action(action_type=ActionType.NO_OP, target=action.target)
-        else:
-            seen_actions.add(action_key)
+            if done and info.get("task_solved") is True:
+                solved = True
 
-        obs, reward, done, info = env.step(action)
+            action_str = action.action_type.value
+            if action.target:
+                action_str += f":{action.target}"
+            diag = action.parameters.get("diagnosis")
+            if diag:
+                action_str += f"[{diag}]"
 
-        step += 1
-        rewards.append(reward)
+            error_str = error.replace("\n", " ").strip() if error else "null"
 
-        if done and info.get("task_solved"):
-            solved = True
+            print(
+                f"[STEP] step={step} action={action_str} "
+                f"reward={reward:.2f} done={'true' if done else 'false'} "
+                f"error={error_str}",
+                flush=True,
+            )
 
-        action_str = action.action_type.value
-        if action.target:
-            action_str += f":{action.target}"
+            messages.append({"role": "assistant", "content": json.dumps({
+                "action_type": action.action_type.value,
+                "target":      action.target,
+                "parameters":  action.parameters,
+            })})
 
-        error_str = error.replace("\n", " ") if error else "null"
+            if done:
+                break
 
+    finally:                                        # [END] always prints
         print(
-            f"[STEP] step={step} action={action_str} "
-            f"reward={reward:.2f} done={'true' if done else 'false'} error={error_str}",
+            f"[END] success={'true' if solved else 'false'} steps={step} "
+            f"rewards={','.join(f'{r:.2f}' for r in rewards)}",
             flush=True,
         )
 
-        # STOP on API failure
-        if error and ("402" in error or "rate" in error.lower() or "timeout" in error.lower()):
-            api_failed = True
-            break
-
-        if done:
-            break
-
-        messages.append({"role": "assistant", "content": json.dumps({
-            "action_type": action.action_type.value,
-            "target": action.target
-        })})
-
-    print(
-        f"[END] success={'true' if solved else 'false'} steps={step} "
-        f"rewards={','.join(f'{r:.2f}' for r in rewards)}",
-        flush=True,
-    )
-
-    return api_failed
-
 # ---------------- MAIN ----------------
-def main():
+def main() -> None:
     for task in list_tasks():
-        failed = _run_episode(task["id"])
-        if failed:
-            break
-
-    # 🔥 KEEP SPACE ALIVE (fix runtime error)
-    while True:
-        time.sleep(60)
+        _run_episode(task["id"])
 
 if __name__ == "__main__":
     main()

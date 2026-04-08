@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from typing import Any
+
+# 🔥 ensure correct path resolution in container
+sys.path.append(".")
 
 from openai import OpenAI
 
-from env    import IncidentResponseEnv
-from models import Action, ActionType, DiagnosisTag   # correct source
-from tasks  import list_tasks                          # correct source
+# ✅ FIXED IMPORTS
+from env.env import IncidentResponseEnv
+from env.models import Action, ActionType, DiagnosisTag
+from env.tasks import list_tasks
 
 # ---------------- CONFIG ----------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1").strip()
@@ -99,7 +104,7 @@ def _run_episode(task_id: str) -> None:
 
     try:
         task_meta = next(t for t in list_tasks() if t["id"] == task_id)
-        max_steps = task_meta["max_steps"]          # respect each task's budget
+        max_steps = task_meta["max_steps"]
 
         env = IncidentResponseEnv(task_id=task_id, seed=SEED)
         obs = env.reset()
@@ -109,7 +114,6 @@ def _run_episode(task_id: str) -> None:
             messages.append({"role": "user", "content": _obs_to_text(obs)})
             action, error = _call_model(messages)
 
-            # Deduplicate without hardcoding a fallback service
             action_key = (action.action_type.value, action.target)
             if action_key in seen_actions:
                 action = Action(action_type=ActionType.NO_OP, target=action.target)
@@ -117,7 +121,7 @@ def _run_episode(task_id: str) -> None:
                 seen_actions.add(action_key)
 
             obs, reward, done, info = env.step(action)
-            step    += 1
+            step += 1
             rewards.append(reward)
 
             if done and info.get("task_solved") is True:
@@ -148,7 +152,7 @@ def _run_episode(task_id: str) -> None:
             if done:
                 break
 
-    finally:                                        # [END] always prints
+    finally:
         print(
             f"[END] success={'true' if solved else 'false'} steps={step} "
             f"rewards={','.join(f'{r:.2f}' for r in rewards)}",

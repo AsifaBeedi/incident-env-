@@ -18,10 +18,10 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from env    import IncidentResponseEnv
-from models import Action, Observation
-from tasks  import list_tasks
 
+from env.models import Action, Observation
+from env.tasks import list_tasks
+from env.env import IncidentResponseEnv
 # ---------------------------------------------------------------------------
 # App + shared env instance
 # ---------------------------------------------------------------------------

@@ -205,8 +205,8 @@ def _derive_alerts(services: list[ServiceState]) -> list[str]:
 
 
 def _clamp(v: float) -> float:
-    EPS = 0.001
-    return round(max(EPS, min(1.0 - EPS, v)), 4)
+    # Strictly bounds to (0, 1) exclusive to pass Phase 2 deep validation
+    return round(max(0.001, min(0.999, v)), 4)
 
 
 # ---------------------------------------------------------------------------

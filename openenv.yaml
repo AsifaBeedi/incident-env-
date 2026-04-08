@@ -1,0 +1,268 @@
+name: IncidentResponseEnv
+version: "1.0.0"
+description: >
+  A multi-task AI incident response environment that simulates real-world
+  DevOps troubleshooting. The agent receives service metrics, log tails, and
+  active alerts, then must diagnose the root cause and apply the correct fix
+  in the fewest steps possible. Rewards are sequence-aware: investigation and
+  correct diagnosis must precede remediation. Misleading signals, red herrings,
+  and delayed symptoms require careful reasoning across all difficulty levels.
+
+interface:
+  reset: "returns Observation"
+  step:  "returns (Observation, float, bool, dict)"
+  state: "returns dict"
+
+reward:
+  range: [0.0, 1.0]
+  type: float
+  description: >
+    Per-step reward clamped to [0.0, 1.0]. Breakdown is returned in
+    info["reward_breakdown"] with named components.
+  components:
+    inspection:   "+0.20  relevant inspect_logs / check_metrics"
+    diagnosis:    "+0.30  correct diagnosis  |  -0.30 wrong  |  -0.10 plausible-wrong"
+    fix:          "+0.50  correct fix action after prior diagnosis"
+    partial_fix:  "+0.02–0.05  symptom treatment (does not resolve root cause)"
+    repeat:       "-0.10  same (action_type, target) pair repeated"
+    no_diagnosis: "-0.20  remediation attempted without a prior diagnosis"
+    harmful:      "-0.30  actively harmful action (e.g. rollback on healthy service)"
+    irrelevant:   "-0.10  action unrelated to the fault"
+    no_op:        "-0.05  wasted step"
+    budget_bonus: "+0.05  correct action taken in first half of episode"
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
+tasks:
+
+  - id: auth-crash-loop
+    name: "Auth Service Crash Loop"
+    difficulty: easy
+    max_steps: 6
+    description: >
+      auth-service is in a crash loop due to a missing environment variable.
+      db-proxy emits connection-reset noise (red herring). The agent must
+      identify the failing service, declare crash_loop as the root cause,
+      and restart auth-service.
+    true_root_cause: crash_loop
+    true_fix_target: auth-service
+    services_affected: [auth-service, db-proxy]
+    optimal_sequence:
+      - inspect_logs:auth-service
+      - restart_service:auth-service[diagnosis=crash_loop]
+    max_achievable_reward: 1.0
+
+  - id: payments-oom-cascade
+    name: "Payments OOM Cascade"
+    difficulty: medium
+    max_steps: 8
+    description: >
+      payments-service is OOM-killed. api-gateway degrades downstream (looks
+      like the root cause). db-proxy emits slow-query noise. auth-service has
+      elevated CPU. The agent must trace the cascade back to the OOM kill,
+      diagnose correctly, and restart payments-service.
+    true_root_cause: oom_kill
+    true_fix_target: payments-service
+    services_affected: [payments-service, api-gateway, auth-service, db-proxy]
+    red_herrings:
+      - "api-gateway shows high latency and 502s (downstream effect, not root cause)"
+      - "db-proxy slow queries (unrelated load spike)"
+    optimal_sequence:
+      - inspect_logs:payments-service
+      - check_metrics:api-gateway
+      - restart_service:payments-service[diagnosis=oom_kill]
+    max_achievable_reward: 1.0
+
+  - id: network-split-db-leak
+    name: "Network Split — DB WAL Saturation"
+    difficulty: hard
+    max_steps: 10
+    description: >
+      A network partition isolated db-proxy from its standby replica, causing
+      WAL transaction log buildup (disk saturation). Four services are degraded
+      with different error patterns. Three competing hypotheses are planted in
+      the logs: OOM on payments-service (elevated memory), bad deploy on
+      api-gateway (version mismatch log), and resource saturation on db-proxy
+      (correct). Restarting a frontend service produces a false improvement
+      (delayed re-degradation one step later). Only clearing the WAL buffer on
+      db-proxy fully resolves the incident.
+    true_root_cause: resource_saturation
+    true_fix_target: db-proxy
+    services_affected:
+      [api-gateway, payments-service, user-service, db-proxy]
+    healthy_services: [auth-service]
+    red_herrings:
+      - "payments-service memory at 62% with growth rate — suggests OOM but is not at limit"
+      - "api-gateway logs show version mismatch and rollback-available — suggests bad deploy"
+      - "auth-service memory warning — unrelated, uses separate replica shard"
+    partial_fixes:
+      - "restart_service api-gateway: service recovers for one step, then re-degrades"
+      - "restart_service payments-service: same delayed re-degradation pattern"
+      - "scale_up db-proxy: reduces CPU briefly, does not fix WAL disk saturation"
+    optimal_sequence:
+      - inspect_logs:db-proxy
+      - check_metrics:payments-service
+      - clear_cache:db-proxy[diagnosis=resource_saturation]
+    max_achievable_reward: 1.0
+
+# ---------------------------------------------------------------------------
+# Action space
+# ---------------------------------------------------------------------------
+action_space:
+  type: discrete
+  schema:
+    action_type:
+      type: enum
+      required: true
+      values:
+        inspect_logs:
+          category: diagnostic
+          state_mutation: false
+          description: "Deep-read logs for one service. Returns all signal entries."
+        check_metrics:
+          category: diagnostic
+          state_mutation: false
+          description: "Pull detailed metrics snapshot for one service."
+        restart_service:
+          category: remediation
+          state_mutation: true
+          description: "Restart a service. Requires prior diagnosis."
+        scale_up:
+          category: remediation
+          state_mutation: true
+          description: "Increase compute allocation for a degraded service."
+        rollback:
+          category: remediation
+          state_mutation: true
+          description: "Roll back the last deployment on a service."
+        clear_cache:
+          category: remediation
+          state_mutation: true
+          description: "Flush the cache or WAL buffer for a service."
+        acknowledge:
+          category: bookkeeping
+          state_mutation: false
+          description: "Acknowledge an alert. Small positive signal if diagnosis not yet set."
+        no_op:
+          category: bookkeeping
+          state_mutation: false
+          description: "Take no action. Incurs a step penalty."
+
+    target:
+      type: string
+      required: false
+      description: "Service name to act on. Null for bookkeeping actions."
+      examples:
+        [api-gateway, auth-service, payments-service, db-proxy,
+         user-service, cache-service]
+
+    parameters:
+      type: object
+      required: false
+      fields:
+        diagnosis:
+          type: enum
+          required: false
+          description: >
+            Agent-declared root-cause hypothesis. Should be set before or
+            alongside the first remediation action. Graded against the hidden
+            true_root_cause.
+          values:
+            [oom_kill, crash_loop, upstream_timeout,
+             resource_saturation, bad_deploy, cache_poisoning]
+
+# ---------------------------------------------------------------------------
+# Observation space
+# ---------------------------------------------------------------------------
+observation_space:
+  type: structured
+  schema:
+    step:
+      type: int
+      description: "Current step number within the episode."
+
+    time:
+      type: float
+      description: "Simulated elapsed time in seconds (30s per step)."
+
+    services:
+      type: list[ServiceState]
+      description: "State snapshot of every service in the system."
+      item_schema:
+        name:         {type: string}
+        status:       {type: enum, values: [healthy, degraded, down]}
+        version:      {type: string}
+        metrics:
+          type: object
+          fields:
+            cpu_usage:    {type: float, range: [0.0, 100.0], unit: percent}
+            memory_usage: {type: float, range: [0.0, 100.0], unit: percent}
+            error_rate:   {type: float, range: [0.0, inf],   unit: errors/s}
+            latency_ms:   {type: float, range: [0.0, inf],   unit: ms}
+            request_rate: {type: float, range: [0.0, inf],   unit: req/s}
+
+    logs:
+      type: list[LogEntry]
+      description: >
+        Mixed log tail. Contains both genuine signal entries and plausible
+        noise. Logs are shuffled; signal position is not deterministic.
+        Use inspect_logs to get the full signal set for a specific service.
+      item_schema:
+        timestamp: {type: float}
+        severity:  {type: enum, values: [info, warning, error, critical]}
+        service:   {type: string}
+        message:   {type: string}
+
+    active_alerts:
+      type: list[string]
+      description: "Human-readable alert strings derived from current service states."
+
+    inspected:
+      type: list[string]
+      description: "Services the agent has already called inspect_logs or check_metrics on."
+
+    diagnosis_set:
+      type: bool
+      description: "True once the agent has submitted any diagnosis parameter."
+
+# ---------------------------------------------------------------------------
+# Info dict (returned as 4th element of step())
+# ---------------------------------------------------------------------------
+info_keys:
+  reward_breakdown:
+    type: object
+    description: "Named reward components. See reward.components above."
+  cumulative_reward:
+    type: float
+    description: "Sum of all per-step rewards this episode, clamped to [0.0, 1.0]."
+  steps_remaining:
+    type: int
+    description: "Steps left before the episode ends by timeout."
+  task_solved:
+    type: bool
+    description: "True if the correct fix was applied and the episode resolved."
+  diagnosis_set:
+    type: bool
+  inspected_services:
+    type: list[string]
+  _true_root_cause:
+    type: string
+    description: "Ground truth root cause. Prefixed _ — for evaluation use only."
+  _true_fix_target:
+    type: string
+    description: "Ground truth fix target. Prefixed _ — for evaluation use only."
+
+# ---------------------------------------------------------------------------
+# Determinism
+# ---------------------------------------------------------------------------
+determinism:
+  seeded: true
+  seed_param: seed
+  description: >
+    All randomness (metrics jitter, log selection, shuffle order) is driven
+    by a single random.Random instance initialised from `seed` at reset().
+    Same seed → identical observation sequence for identical action sequence.
+
+entry_point: "env.py:IncidentResponseEnv"
+inference_script: "inference.py"

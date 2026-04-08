@@ -205,7 +205,8 @@ def _derive_alerts(services: list[ServiceState]) -> list[str]:
 
 
 def _clamp(v: float) -> float:
-    return round(max(0.0, min(1.0, v)), 4)
+    EPS = 0.001
+    return round(max(EPS, min(1.0 - EPS, v)), 4)
 
 
 # ---------------------------------------------------------------------------

@@ -9,7 +9,7 @@ from env import IncidentResponseEnv, Action, ActionType, DiagnosisTag, list_task
 
 # ---------------- CONFIG ----------------
 API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1").strip()
-MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct").strip()
+MODEL_NAME   = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-7B-Instruct").strip()
 HF_TOKEN     = os.getenv("HF_TOKEN", "").strip()
 
 ENV_NAME = "IncidentResponseEnv"
@@ -32,6 +32,7 @@ Available diagnosis:
 {json.dumps(_VALID_DIAGNOSES)}
 
 Rules:
+- ALWAYS include both action_type and target
 - Inspect → Diagnose → Fix
 - Never repeat actions
 - Never fix without diagnosis
@@ -68,21 +69,29 @@ def _call_model(messages):
         )
         raw = res.choices[0].message.content.strip()
     except Exception as e:
-        return Action(action_type=ActionType.NO_OP), str(e)
+        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), str(e)
 
     try:
         data = json.loads(raw)
     except:
-        return Action(action_type=ActionType.NO_OP), "json_error"
+        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), "json_error"
 
     atype = data.get("action_type")
+    target = data.get("target")
+
+    # 🔥 HARD GUARDRAILS
     if atype not in _VALID_ACTION_TYPES:
-        return Action(action_type=ActionType.NO_OP), "invalid_action"
+        return Action(action_type=ActionType.INSPECT_LOGS, target="auth-service"), "invalid_action"
+
+    if not target or not isinstance(target, str):
+        target = "auth-service"
+
+    params = data.get("parameters", {}) or {}
 
     return Action(
         action_type=ActionType(atype),
-        target=data.get("target"),
-        parameters=data.get("parameters", {}),
+        target=target,
+        parameters=params,
     ), None
 
 # ---------------- EPISODE ----------------
@@ -125,7 +134,7 @@ def _run_episode(task_id) -> bool:
             flush=True,
         )
 
-        # 🚨 STOP ON API FAILURE
+        # STOP on API failure
         if error and ("402" in error or "rate" in error.lower() or "timeout" in error.lower()):
             api_failed = True
             break
@@ -134,7 +143,8 @@ def _run_episode(task_id) -> bool:
             break
 
         messages.append({"role": "assistant", "content": json.dumps({
-            "action_type": action.action_type.value
+            "action_type": action.action_type.value,
+            "target": action.target
         })})
 
     print(
@@ -147,17 +157,10 @@ def _run_episode(task_id) -> bool:
 
 # ---------------- MAIN ----------------
 def main():
-    stop_all = False
-
     for task in list_tasks():
-        if stop_all:
-            break
-
         failed = _run_episode(task["id"])
-
         if failed:
-            stop_all = True
-
+            break
 
 if __name__ == "__main__":
     main()

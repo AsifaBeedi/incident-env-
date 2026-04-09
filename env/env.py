@@ -203,11 +203,9 @@ def _derive_alerts(services: list[ServiceState]) -> list[str]:
             alerts.append(f"WARNING [{svc.name}] memory={svc.metrics.memory_usage:.1f}%")
     return alerts
 
-
 def _clamp(v: float) -> float:
-    # Strictly bounds to (0, 1) exclusive to pass Phase 2 deep validation
-    return round(max(0.001, min(0.999, v)), 4)
-
+    # Absolutely prevents the cumulative score from hitting exactly 0.0 or 1.0
+    return round(max(0.0100, min(0.9900, v)), 4)
 
 # ---------------------------------------------------------------------------
 # Environment

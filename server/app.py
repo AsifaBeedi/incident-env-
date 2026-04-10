@@ -4,7 +4,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# 🔧 FIX: Add parent directory to path so we can import from env/
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fastapi import FastAPI, Body, Request
@@ -12,7 +11,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# Now these imports will work
 from env.models import Action, ActionType, Observation
 from env.tasks import list_tasks
 from env.env import IncidentResponseEnv
@@ -28,23 +26,32 @@ def _get_env(task_id="auth-crash-loop") -> IncidentResponseEnv:
         _env.reset()
     return _env
 
-# 🔧 FIXED: Stricter safe float that guarantees values strictly between 0 and 1
 def _safe_float(v: Any) -> float:
     try:
         val = float(v)
     except (TypeError, ValueError):
-        val = 0.51  # Safe default strictly between 0 and 1
-    
-    # Force strictly between 0 and 1 (not inclusive)
+        return 0.51
     if val <= 0.0:
-        return 0.011
+        return 0.02
     if val >= 1.0:
-        return 0.989
-    return round(max(0.011, min(0.989, val)), 4)
+        return 0.98
+    if val < 0.01:
+        return 0.02
+    if val > 0.99:
+        return 0.98
+    return round(val, 4)
 
 def _sanitize_info(info: dict) -> dict:
     if "cumulative_reward" in info:
         info["cumulative_reward"] = _safe_float(info["cumulative_reward"])
+    if "reward_breakdown" in info:
+        rb = info["reward_breakdown"]
+        if "final" in rb:
+            rb["final"] = _safe_float(rb["final"])
+        if "raw" in rb:
+            rb["raw"] = _safe_float(rb["raw"])
+    if "_true_root_cause" in info and hasattr(info["_true_root_cause"], 'value'):
+        info["_true_root_cause"] = info["_true_root_cause"].value
     return info
 
 class ResetRequest(BaseModel):
@@ -78,9 +85,17 @@ def step(action: Action):
         obs = env._build_observation()
         return {
             "observation": obs.model_dump(),
-            "reward": 0.011,  # 🔧 FIXED: Safe value > 0
+            "reward": 0.02,
             "done": True,
-            "info": {"cumulative_reward": 0.51, "task_solved": False}  # 🔧 FIXED: Safe value
+            "info": {
+                "cumulative_reward": 0.02,
+                "task_solved": False,
+                "steps_remaining": 0,
+                "diagnosis_set": False,
+                "inspected_services": [],
+                "_true_root_cause": "unknown",
+                "_true_fix_target": "",
+            }
         }
 
 @app.exception_handler(RequestValidationError)
@@ -90,7 +105,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
         fallback_action = Action(action_type=ActionType.NO_OP)
         obs, reward, done, info = env.step(fallback_action)
         return JSONResponse(
-            status_code=200, 
+            status_code=200,
             content={
                 "observation": obs.model_dump(),
                 "reward": _safe_float(reward),
@@ -104,9 +119,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             status_code=200,
             content={
                 "observation": obs.model_dump(),
-                "reward": 0.011,  # 🔧 FIXED: Safe value > 0
+                "reward": 0.02,
                 "done": True,
-                "info": {"cumulative_reward": 0.51, "task_solved": False}  # 🔧 FIXED: Safe value
+                "info": {
+                    "cumulative_reward": 0.02,
+                    "task_solved": False,
+                    "steps_remaining": 0,
+                    "diagnosis_set": False,
+                    "inspected_services": [],
+                    "_true_root_cause": "unknown",
+                    "_true_fix_target": "",
+                }
             }
         )
 
@@ -114,7 +137,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 def state():
     env = _get_env()
     s = env.state()
-    s["cumulative_reward"] = _safe_float(s.get("cumulative_reward", 0.51))
+    s["cumulative_reward"] = _safe_float(s.get("cumulative_reward", 0.02))
     return {"state": s}
 
 @app.get("/health")
@@ -125,12 +148,9 @@ def health():
 def tasks():
     return {"tasks": list_tasks()}
 
-# 🔧 REQUIRED: Explicit main() function for Hugging Face validator
 def main():
-    """Main entry point for the application."""
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)
 
-# 🔧 REQUIRED: Guard that calls main()
 if __name__ == "__main__":
     main()

@@ -7,17 +7,15 @@ description: >
   in the fewest steps possible. Rewards are sequence-aware: investigation and
   correct diagnosis must precede remediation. Misleading signals, red herrings,
   and delayed symptoms require careful reasoning across all difficulty levels.
-
 interface:
   reset: "returns Observation"
   step:  "returns (Observation, float, bool, dict)"
   state: "returns dict"
-
 reward:
-  range: [0.0, 1.0]
+  range: [0.01, 0.99]
   type: float
   description: >
-    Per-step reward clamped to [0.0, 1.0]. Breakdown is returned in
+    Per-step reward clamped to [0.01, 0.99]. Breakdown is returned in
     info["reward_breakdown"] with named components.
   components:
     inspection:   "+0.20  relevant inspect_logs / check_metrics"
@@ -30,12 +28,10 @@ reward:
     irrelevant:   "-0.10  action unrelated to the fault"
     no_op:        "-0.05  wasted step"
     budget_bonus: "+0.05  correct action taken in first half of episode"
-
 # ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
 tasks:
-
   - id: auth-crash-loop
     name: "Auth Service Crash Loop"
     difficulty: easy
@@ -51,7 +47,7 @@ tasks:
     optimal_sequence:
       - inspect_logs:auth-service
       - restart_service:auth-service[diagnosis=crash_loop]
-    max_achievable_reward: 1.0
+    max_achievable_reward: 0.99
 
   - id: payments-oom-cascade
     name: "Payments OOM Cascade"
@@ -72,7 +68,7 @@ tasks:
       - inspect_logs:payments-service
       - check_metrics:api-gateway
       - restart_service:payments-service[diagnosis=oom_kill]
-    max_achievable_reward: 1.0
+    max_achievable_reward: 0.99
 
   - id: network-split-db-leak
     name: "Network Split — DB WAL Saturation"
@@ -104,8 +100,7 @@ tasks:
       - inspect_logs:db-proxy
       - check_metrics:payments-service
       - clear_cache:db-proxy[diagnosis=resource_saturation]
-    max_achievable_reward: 1.0
-
+    max_achievable_reward: 0.99
 # ---------------------------------------------------------------------------
 # Action space
 # ---------------------------------------------------------------------------
@@ -148,7 +143,6 @@ action_space:
           category: bookkeeping
           state_mutation: false
           description: "Take no action. Incurs a step penalty."
-
     target:
       type: string
       required: false
@@ -156,7 +150,6 @@ action_space:
       examples:
         [api-gateway, auth-service, payments-service, db-proxy,
          user-service, cache-service]
-
     parameters:
       type: object
       required: false
@@ -171,7 +164,6 @@ action_space:
           values:
             [oom_kill, crash_loop, upstream_timeout,
              resource_saturation, bad_deploy, cache_poisoning]
-
 # ---------------------------------------------------------------------------
 # Observation space
 # ---------------------------------------------------------------------------
@@ -181,11 +173,9 @@ observation_space:
     step:
       type: int
       description: "Current step number within the episode."
-
     time:
       type: float
       description: "Simulated elapsed time in seconds (30s per step)."
-
     services:
       type: list[ServiceState]
       description: "State snapshot of every service in the system."
@@ -201,7 +191,6 @@ observation_space:
             error_rate:   {type: float, range: [0.0, inf],   unit: errors/s}
             latency_ms:   {type: float, range: [0.0, inf],   unit: ms}
             request_rate: {type: float, range: [0.0, inf],   unit: req/s}
-
     logs:
       type: list[LogEntry]
       description: >
@@ -213,19 +202,15 @@ observation_space:
         severity:  {type: enum, values: [info, warning, error, critical]}
         service:   {type: string}
         message:   {type: string}
-
     active_alerts:
       type: list[string]
       description: "Human-readable alert strings derived from current service states."
-
     inspected:
       type: list[string]
       description: "Services the agent has already called inspect_logs or check_metrics on."
-
     diagnosis_set:
       type: bool
       description: "True once the agent has submitted any diagnosis parameter."
-
 # ---------------------------------------------------------------------------
 # Info dict (returned as 4th element of step())
 # ---------------------------------------------------------------------------
@@ -252,7 +237,6 @@ info_keys:
   _true_fix_target:
     type: string
     description: "Ground truth fix target. Prefixed _ — for evaluation use only."
-
 # ---------------------------------------------------------------------------
 # Determinism
 # ---------------------------------------------------------------------------
@@ -263,6 +247,5 @@ determinism:
     All randomness (metrics jitter, log selection, shuffle order) is driven
     by a single random.Random instance initialised from `seed` at reset().
     Same seed → identical observation sequence for identical action sequence.
-
 entry_point: "env.py:IncidentResponseEnv"
 inference_script: "inference.py"

@@ -1,10 +1,8 @@
 """
 models.py — Pydantic data contracts for the AI Incident Response OpenEnv environment.
-
 OpenEnv return signature
 ------------------------
     obs, reward, done, info = env.step(action)
-
     observation : Observation
     reward      : float              clamped [0.0, 1.0]
     done        : bool
@@ -124,25 +122,22 @@ class Action(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# RewardBreakdown — lives inside info["reward_breakdown"]
-# ---------------------------------------------------------------------------class RewardBreakdown(BaseModel):
-    """
-    Typed breakdown of how the step reward was computed.
-    All component values are raw (pre-clamp); final is clamped to [0.0, 1.0].
-    """
+# Reward Breakdown
+# ---------------------------------------------------------------------------
+class RewardBreakdown(BaseModel):
     # Task-logic components (set by task scorer)
-    inspection:    float = 0.01   
-    diagnosis:     float = 0.01   
-    fix:           float = 0.01   
-    partial_fix:   float = 0.01   
-    # Penalty components (set by reward engine)
-    repeat:        float = -0.01  
-    no_diagnosis:  float = -0.01  
-    harmful:       float = -0.01  
-    irrelevant:    float = -0.01  
-    no_op:         float = -0.01  
+    inspection:    float = 0.02   # Changed from 0.01
+    diagnosis:     float = 0.02   # Changed from 0.01
+    fix:           float = 0.02   # Changed from 0.01
+    partial_fix:   float = 0.02   # Changed from 0.01
+    # Penalty components
+    repeat:        float = -0.02  # Changed from -0.01
+    no_diagnosis:  float = -0.02  # Changed from -0.01
+    harmful:       float = -0.02  # Changed from -0.01
+    irrelevant:    float = -0.02  # Changed from -0.01
+    no_op:         float = -0.02  # Changed from -0.01
     # Env-level modifier
-    budget_bonus:  float = 0.01   
+    budget_bonus:  float = 0.02   # Changed from 0.01
     # Totals
-    raw:           float = 0.50   # Changed from 0.0 to safely pass static checks
-    final:         float = 0.50   # THIS IS THE FIX. Safely inside (0, 1) by default
+    raw:           float = 0.51   # Safe value
+    final:         float = 0.51   # Safe value

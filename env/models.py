@@ -1,10 +1,12 @@
 """
 models.py — Pydantic data contracts for the AI Incident Response OpenEnv environment.
+
 OpenEnv return signature
 ------------------------
     obs, reward, done, info = env.step(action)
+
     observation : Observation
-    reward      : float              clamped [0.0, 1.0]
+    reward      : float              strictly in (0.0, 1.0)
     done        : bool
     info        : dict               see RewardBreakdown + episode stats
 """
@@ -27,20 +29,17 @@ class ServiceStatus(str, Enum):
 
 
 class ActionType(str, Enum):
-    # Diagnostic — no state mutation; produce richer log/metric slices
-    INSPECT_LOGS  = "inspect_logs"
-    CHECK_METRICS = "check_metrics"
-    # Remediation — mutate system state
+    INSPECT_LOGS    = "inspect_logs"
+    CHECK_METRICS   = "check_metrics"
     RESTART_SERVICE = "restart_service"
     SCALE_UP        = "scale_up"
     ROLLBACK        = "rollback"
     CLEAR_CACHE     = "clear_cache"
-    # Bookkeeping
-    ACKNOWLEDGE = "acknowledge"
-    NO_OP       = "no_op"
+    ACKNOWLEDGE     = "acknowledge"
+    NO_OP           = "no_op"
 
 
-# Remediation action types — used by the reward engine to enforce diagnosis-first
+# Remediation action types — used by reward engine to enforce diagnosis-first
 REMEDIATION_ACTIONS: frozenset[ActionType] = frozenset({
     ActionType.RESTART_SERVICE,
     ActionType.SCALE_UP,
@@ -57,11 +56,6 @@ class Severity(str, Enum):
 
 
 class DiagnosisTag(str, Enum):
-    """
-    Agent-declared root-cause hypothesis.
-    Pass via  action.parameters["diagnosis"] = DiagnosisTag.XYZ
-    alongside any action (typically a remediation action).
-    """
     OOM_KILL            = "oom_kill"
     CRASH_LOOP          = "crash_loop"
     UPSTREAM_TIMEOUT    = "upstream_timeout"
@@ -104,7 +98,7 @@ class Observation(BaseModel):
     step:          int
     time:          float
     services:      list[ServiceState]
-    logs:          list[LogEntry]      # mixed signal + noise; may be misleading
+    logs:          list[LogEntry]
     active_alerts: list[str]
     inspected:     list[str] = Field(default_factory=list)
     diagnosis_set: bool      = False
@@ -118,26 +112,28 @@ class Action(BaseModel):
     action_type: ActionType
     target:      str | None = None
     parameters:  dict[str, Any] = Field(default_factory=dict)
-    # parameters["diagnosis"] = DiagnosisTag  — declare root cause hypothesis
 
 
 # ---------------------------------------------------------------------------
-# Reward Breakdown
+# RewardBreakdown
+# ALL defaults are 0.0 — only the fields actually set by task/engine matter.
+# Non-zero defaults were the root cause of corrupted reward signals.
 # ---------------------------------------------------------------------------
+
 class RewardBreakdown(BaseModel):
-    # Task-logic components (set by task scorer)
-    inspection:    float = 0.02   # Changed from 0.01
-    diagnosis:     float = 0.02   # Changed from 0.01
-    fix:           float = 0.02   # Changed from 0.01
-    partial_fix:   float = 0.02   # Changed from 0.01
-    # Penalty components
-    repeat:        float = -0.02  # Changed from -0.01
-    no_diagnosis:  float = -0.02  # Changed from -0.01
-    harmful:       float = -0.02  # Changed from -0.01
-    irrelevant:    float = -0.02  # Changed from -0.01
-    no_op:         float = -0.02  # Changed from -0.01
-    # Env-level modifier
-    budget_bonus:  float = 0.02   # Changed from 0.01
-    # Totals
-    raw:           float = 0.51   # Safe value
-    final:         float = 0.51   # Safe value
+    # Task-logic components
+    inspection:   float = 0.0
+    diagnosis:    float = 0.0
+    fix:          float = 0.0
+    partial_fix:  float = 0.0
+    harmful:      float = 0.0
+    irrelevant:   float = 0.0
+    # Engine penalty components
+    repeat:       float = 0.0
+    no_diagnosis: float = 0.0
+    no_op:        float = 0.0
+    # Engine bonus
+    budget_bonus: float = 0.0
+    # Totals — computed by reward_engine, never set manually
+    raw:          float = 0.0
+    final:        float = 0.0

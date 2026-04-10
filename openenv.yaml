@@ -5,8 +5,7 @@ description: >
   DevOps troubleshooting. The agent receives service metrics, log tails, and
   active alerts, then must diagnose the root cause and apply the correct fix
   in the fewest steps possible. Rewards are sequence-aware: investigation and
-  correct diagnosis must precede remediation. Misleading signals, red herrings,
-  and delayed symptoms require careful reasoning across all difficulty levels.
+  correct diagnosis must precede remediation.
 
 interface:
   reset: "returns Observation"
@@ -14,103 +13,81 @@ interface:
   state: "returns dict"
 
 reward:
-  range: [0.02, 0.98]
+  range: [0.0, 1.0]
   type: float
   description: >
-    Per-step reward strictly clamped to [0.02, 0.98]. Breakdown is returned in
-    info["reward_breakdown"] with named components.
+    Per-step reward strictly in (0.0, 1.0). Breakdown in info["reward_breakdown"].
   components:
     inspection:   "+0.15  relevant inspect_logs / check_metrics"
-    diagnosis:    "+0.15  correct diagnosis  |  -0.08 wrong  |  -0.08 plausible-wrong"
-    fix:          "+0.25  correct fix action after prior diagnosis"
-    partial_fix:  "+0.03–0.05  symptom treatment (does not resolve root cause)"
-    repeat:       "-0.08  same (action_type, target) pair repeated"
-    no_diagnosis: "-0.15  remediation attempted without a prior diagnosis"
-    harmful:      "-0.15  actively harmful action (e.g. rollback on healthy service)"
-    irrelevant:   "-0.08  action unrelated to the fault"
+    diagnosis:    "+0.15  correct  |  -0.08 plausible-wrong  |  -0.15 wrong"
+    fix:          "+0.25  correct fix after prior diagnosis"
+    partial_fix:  "+0.02–0.05  symptom treatment"
+    repeat:       "-0.08  same (action_type, target) repeated"
+    no_diagnosis: "-0.15  remediation without prior diagnosis"
+    harmful:      "-0.15  actively harmful action"
+    irrelevant:   "-0.08  unrelated action"
     no_op:        "-0.03  wasted step"
-    budget_bonus: "+0.03  correct action taken in first half of episode"
+    budget_bonus: "+0.03  correct action in first half of episode"
 
-# ---------------------------------------------------------------------------
-# Tasks
-# ---------------------------------------------------------------------------
 tasks:
+
   - id: auth-crash-loop
     name: "Auth Service Crash Loop"
     difficulty: easy
     max_steps: 6
     description: >
-      auth-service is in a crash loop due to a missing environment variable.
-      db-proxy emits connection-reset noise (red herring). The agent must
-      identify the failing service, declare crash_loop as the root cause,
-      and restart auth-service.
+      auth-service is in a crash loop. db-proxy emits connection noise
+      (red herring). Inspect auth-service, diagnose crash_loop, restart it.
     true_root_cause: crash_loop
     true_fix_target: auth-service
     services_affected: [auth-service, db-proxy]
     optimal_sequence:
       - inspect_logs:auth-service
       - restart_service:auth-service[diagnosis=crash_loop]
-    max_achievable_reward: 0.98
-    min_achievable_reward: 0.02
 
   - id: payments-oom-cascade
     name: "Payments OOM Cascade"
     difficulty: medium
     max_steps: 8
     description: >
-      payments-service is OOM-killed. api-gateway degrades downstream (looks
-      like the root cause). db-proxy emits slow-query noise. auth-service has
-      elevated CPU. The agent must trace the cascade back to the OOM kill,
-      diagnose correctly, and restart payments-service.
+      payments-service is OOM-killed. api-gateway degrades downstream.
+      db-proxy slow queries are a red herring. Trace the cascade to payments,
+      diagnose oom_kill, restart payments-service.
     true_root_cause: oom_kill
     true_fix_target: payments-service
     services_affected: [payments-service, api-gateway, auth-service, db-proxy]
     red_herrings:
-      - "api-gateway shows high latency and 502s (downstream effect, not root cause)"
-      - "db-proxy slow queries (unrelated load spike)"
+      - "api-gateway 502s — downstream effect, not root cause"
+      - "db-proxy slow queries — unrelated"
     optimal_sequence:
       - inspect_logs:payments-service
       - check_metrics:api-gateway
       - restart_service:payments-service[diagnosis=oom_kill]
-    max_achievable_reward: 0.98
-    min_achievable_reward: 0.02
 
   - id: network-split-db-leak
     name: "Network Split — DB WAL Saturation"
     difficulty: hard
     max_steps: 10
     description: >
-      A network partition isolated db-proxy from its standby replica, causing
-      WAL transaction log buildup (disk saturation). Four services are degraded
-      with different error patterns. Three competing hypotheses are planted in
-      the logs: OOM on payments-service (elevated memory), bad deploy on
-      api-gateway (version mismatch log), and resource saturation on db-proxy
-      (correct). Restarting a frontend service produces a false improvement
-      (delayed re-degradation one step later). Only clearing the WAL buffer on
-      db-proxy fully resolves the incident.
+      db-proxy WAL disk saturation from a network partition. Three competing
+      hypotheses in the logs. Restarting frontends gives a false improvement
+      before re-degrading. Only clearing WAL on db-proxy resolves the incident.
     true_root_cause: resource_saturation
     true_fix_target: db-proxy
-    services_affected:
-      [api-gateway, payments-service, user-service, db-proxy]
+    services_affected: [api-gateway, payments-service, user-service, db-proxy]
     healthy_services: [auth-service]
     red_herrings:
-      - "payments-service memory at 62% with growth rate — suggests OOM but is not at limit"
-      - "api-gateway logs show version mismatch and rollback-available — suggests bad deploy"
-      - "auth-service memory warning — unrelated, uses separate replica shard"
+      - "payments memory 62% — not at OOM limit"
+      - "api-gateway version mismatch — not a bad deploy"
     partial_fixes:
-      - "restart_service api-gateway: service recovers for one step, then re-degrades"
-      - "restart_service payments-service: same delayed re-degradation pattern"
-      - "scale_up db-proxy: reduces CPU briefly, does not fix WAL disk saturation"
+      - "restart_service api-gateway — recovers then re-degrades next step"
+      - "restart_service payments-service — same pattern"
+      - "scale_up db-proxy — reduces CPU, does not fix WAL"
     optimal_sequence:
       - inspect_logs:db-proxy
       - check_metrics:payments-service
       - clear_cache:db-proxy[diagnosis=resource_saturation]
-    max_achievable_reward: 0.98
-    min_achievable_reward: 0.02
 
-# ---------------------------------------------------------------------------
-# Action space
-# ---------------------------------------------------------------------------
 action_space:
   type: discrete
   schema:
@@ -118,36 +95,18 @@ action_space:
       type: enum
       required: true
       values:
-        inspect_logs:
-          category: diagnostic
-          state_mutation: false
-        check_metrics:
-          category: diagnostic
-          state_mutation: false
-        restart_service:
-          category: remediation
-          state_mutation: true
-        scale_up:
-          category: remediation
-          state_mutation: true
-        rollback:
-          category: remediation
-          state_mutation: true
-        clear_cache:
-          category: remediation
-          state_mutation: true
-        acknowledge:
-          category: bookkeeping
-          state_mutation: false
-        no_op:
-          category: bookkeeping
-          state_mutation: false
+        inspect_logs:    {category: diagnostic,   state_mutation: false}
+        check_metrics:   {category: diagnostic,   state_mutation: false}
+        restart_service: {category: remediation,  state_mutation: true}
+        scale_up:        {category: remediation,  state_mutation: true}
+        rollback:        {category: remediation,  state_mutation: true}
+        clear_cache:     {category: remediation,  state_mutation: true}
+        acknowledge:     {category: bookkeeping,  state_mutation: false}
+        no_op:           {category: bookkeeping,  state_mutation: false}
     target:
       type: string
       required: false
-      examples:
-        [api-gateway, auth-service, payments-service, db-proxy,
-         user-service, cache-service]
+      examples: [api-gateway, auth-service, payments-service, db-proxy, user-service]
     parameters:
       type: object
       required: false
@@ -155,26 +114,20 @@ action_space:
         diagnosis:
           type: enum
           required: false
-          values:
-            [oom_kill, crash_loop, upstream_timeout,
-             resource_saturation, bad_deploy, cache_poisoning]
+          values: [oom_kill, crash_loop, upstream_timeout,
+                   resource_saturation, bad_deploy, cache_poisoning]
 
-# ---------------------------------------------------------------------------
-# Observation space
-# ---------------------------------------------------------------------------
 observation_space:
   type: structured
   schema:
-    step:
-      type: int
-    time:
-      type: float
+    step:          {type: int}
+    time:          {type: float}
     services:
       type: list[ServiceState]
       item_schema:
-        name:         {type: string}
-        status:       {type: enum, values: [healthy, degraded, down]}
-        version:      {type: string}
+        name:    {type: string}
+        status:  {type: enum, values: [healthy, degraded, down]}
+        version: {type: string}
         metrics:
           type: object
           fields:
@@ -190,43 +143,25 @@ observation_space:
         severity:  {type: enum, values: [info, warning, error, critical]}
         service:   {type: string}
         message:   {type: string}
-    active_alerts:
-      type: list[string]
-    inspected:
-      type: list[string]
-    diagnosis_set:
-      type: bool
+    active_alerts:   {type: list[string]}
+    inspected:       {type: list[string]}
+    diagnosis_set:   {type: bool}
 
-# ---------------------------------------------------------------------------
-# Info dict
-# ---------------------------------------------------------------------------
 info_keys:
-  reward_breakdown:
-    type: object
-  cumulative_reward:
-    type: float
-  steps_remaining:
-    type: int
-  task_solved:
-    type: bool
-  diagnosis_set:
-    type: bool
-  inspected_services:
-    type: list[string]
-  _true_root_cause:
-    type: string
-  _true_fix_target:
-    type: string
+  reward_breakdown:    {type: object}
+  cumulative_reward:   {type: float}
+  steps_remaining:     {type: int}
+  task_solved:         {type: bool}
+  diagnosis_set:       {type: bool}
+  inspected_services:  {type: list[string]}
+  _true_root_cause:    {type: string}
+  _true_fix_target:    {type: string}
 
-# ---------------------------------------------------------------------------
-# Determinism
-# ---------------------------------------------------------------------------
 determinism:
   seeded: true
   seed_param: seed
   description: >
-    All randomness driven by a single random.Random instance initialised
-    from `seed` at reset().
+    All randomness driven by a single random.Random instance from `seed` at reset().
 
-entry_point: "env.py:IncidentResponseEnv"
+entry_point: "env/env.py:IncidentResponseEnv"
 inference_script: "inference.py"

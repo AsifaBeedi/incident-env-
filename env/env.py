@@ -203,9 +203,19 @@ def _derive_alerts(services: list[ServiceState]) -> list[str]:
             alerts.append(f"WARNING [{svc.name}] memory={svc.metrics.memory_usage:.1f}%")
     return alerts
 
+
+# 🔥 BRUTE FORCE SAFETY - Guarantees value is strictly between 0 and 1
 def _clamp(v: float) -> float:
-    # Absolutely prevents the cumulative score from hitting exactly 0.0 or 1.0
-    return round(max(0.0100, min(0.9900, v)), 4)
+    """
+    Ensure value is STRICTLY between 0 and 1 (not inclusive).
+    Returns 0.02 for very low values, 0.98 for very high values.
+    """
+    if v <= 0.01:
+        return 0.02
+    if v >= 0.99:
+        return 0.98
+    return round(max(0.02, min(0.98, v)), 4)
+
 
 # ---------------------------------------------------------------------------
 # Environment
@@ -230,7 +240,7 @@ class IncidentResponseEnv:
         self._step_count:        int                = 0
         self._sim_time:          float              = 0.0
         self._done:              bool               = False
-        self._cumulative_reward: float              = 0.0
+        self._cumulative_reward: float              = 0.02  # 🔥 SAFE START VALUE
         self._ctx:               EpisodeContext     = EpisodeContext()
         self._history:           list[dict]         = []
 
@@ -243,7 +253,7 @@ class IncidentResponseEnv:
         self._step_count     = 0
         self._sim_time       = 0.0
         self._done           = False
-        self._cumulative_reward = 0.0
+        self._cumulative_reward = 0.02  # 🔥 SAFE START VALUE
         self._ctx            = EpisodeContext()
         self._history        = []
         self._services       = _base_services(self._rng)
@@ -264,7 +274,6 @@ class IncidentResponseEnv:
         self._ctx.actions_taken.append(action.action_type)
 
         # ── Task scoring ─────────────────────────────────────────────────
-        # task_components runs BEFORE _apply_action so scorer sees pre-state
         rb_partial, task_done = self._task.task_components(
             action, self._services, self._ctx,
         )
@@ -279,8 +288,16 @@ class IncidentResponseEnv:
         inspect_target = self._apply_action(action)
 
         obs    = self._build_observation(inspect_target=inspect_target)
-        reward = rb.final
+        reward = _clamp(rb.final)
+        
+        # 🔥 Update cumulative reward with double safety
         self._cumulative_reward = _clamp(self._cumulative_reward + reward)
+        
+        # 🔥 EXTRA SAFETY: Ensure cumulative never hits boundaries
+        if self._cumulative_reward <= 0.01:
+            self._cumulative_reward = 0.02
+        if self._cumulative_reward >= 0.99:
+            self._cumulative_reward = 0.98
 
         step_limit = self._step_count >= self._task.max_steps
         self._done = task_done or step_limit
@@ -292,7 +309,6 @@ class IncidentResponseEnv:
             "task_solved":        task_done,
             "diagnosis_set":      self._ctx.diagnosis is not None,
             "inspected_services": list(self._ctx.inspected),
-            # Eval-only — agents should treat these as opaque
             "_true_root_cause":   self._task.true_root_cause,
             "_true_fix_target":   self._task.true_fix_target,
         }
@@ -307,13 +323,19 @@ class IncidentResponseEnv:
         return obs, reward, self._done, info
 
     def state(self) -> dict[str, Any]:
+        safe_cumulative = self._cumulative_reward
+        if safe_cumulative <= 0.01:
+            safe_cumulative = 0.02
+        if safe_cumulative >= 0.99:
+            safe_cumulative = 0.98
+            
         return {
             "task":               self._task.id,
             "difficulty":         self._task.difficulty,
             "step":               self._step_count,
             "sim_time":           self._sim_time,
             "done":               self._done,
-            "cumulative_reward":  self._cumulative_reward,
+            "cumulative_reward":  safe_cumulative,
             "services":           [s.model_dump() for s in self._services],
             "alerts":             _derive_alerts(self._services),
             "diagnosis":          self._ctx.diagnosis,
@@ -323,15 +345,12 @@ class IncidentResponseEnv:
             "_true_fix_target":   self._task.true_fix_target,
         }
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+    def close(self) -> None:
+        """Clean up environment resources."""
+        self._done = True
+        pass
 
     def _apply_action(self, action: Action) -> str | None:
-        """
-        Mutate _services. Returns inspect_target if this was a diagnostic action.
-        Also applies hard-task partial-fix re-degradation logic.
-        """
         target = (action.target or "").lower()
         task   = self._task.id
 
@@ -345,20 +364,15 @@ class IncidentResponseEnv:
                     svc.status  = ServiceStatus.HEALTHY
                     svc.metrics = _healthy_metrics(self._rng)
 
-            # Medium task cascade: fixing payments also heals gateway
             if task == "payments-oom-cascade" and target == "payments-service":
                 for svc in self._services:
                     if svc.name == "api-gateway" and svc.status == ServiceStatus.DEGRADED:
                         svc.status  = ServiceStatus.HEALTHY
                         svc.metrics = _healthy_metrics(self._rng)
 
-            # Hard task: restarting a frontend applies partial fix then marks it
-            # for re-degradation on the NEXT observation build (delayed symptom)
             if task == "network-split-db-leak" and target in (
                 "api-gateway", "payments-service", "user-service",
             ):
-                # Service appears healthy now, but will re-degrade next step
-                # We mark it via partial_fixes; env degrades it on next observation
                 self._ctx.partial_fixes[f"redeg_{target}"] = self._step_count
 
         elif action.action_type == ActionType.SCALE_UP:
@@ -372,20 +386,17 @@ class IncidentResponseEnv:
                 if svc.name == target:
                     svc.metrics.memory_usage = max(0.0, svc.metrics.memory_usage - 20)
 
-            # Hard task: clearing db-proxy WAL resolves everything
             if task == "network-split-db-leak" and target == "db-proxy":
                 for svc in self._services:
                     if svc.name in ("api-gateway", "payments-service",
                                     "user-service", "db-proxy"):
                         svc.status  = ServiceStatus.HEALTHY
                         svc.metrics = _healthy_metrics(self._rng)
-                # Clear any pending re-degradation markers
                 for key in list(self._ctx.partial_fixes.keys()):
                     if key.startswith("redeg_"):
                         del self._ctx.partial_fixes[key]
 
         elif action.action_type == ActionType.ROLLBACK:
-            # Rollback on a healthy service causes brief degradation
             for svc in self._services:
                 if svc.name == target:
                     svc.status              = ServiceStatus.DEGRADED
@@ -395,17 +406,11 @@ class IncidentResponseEnv:
         return None
 
     def _build_observation(self, inspect_target: str | None = None) -> Observation:
-        """
-        Build observation. Also applies delayed re-degradation for the hard task:
-        services marked for re-degradation one step ago are flipped back to DEGRADED.
-        """
-        # Hard-task delayed symptom: re-degrade services that were "fixed" last step
         if self._task.id == "network-split-db-leak":
             for key, fixed_at_step in list(self._ctx.partial_fixes.items()):
                 if not key.startswith("redeg_"):
                     continue
                 svc_name = key[len("redeg_"):]
-                # Re-degrade on the step AFTER the fix was applied
                 if self._step_count > fixed_at_step:
                     for svc in self._services:
                         if svc.name == svc_name and svc.status == ServiceStatus.HEALTHY:

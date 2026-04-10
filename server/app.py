@@ -1,4 +1,3 @@
-# server/app.py
 from __future__ import annotations
 
 import sys
@@ -126,8 +125,12 @@ def health():
 def tasks():
     return {"tasks": list_tasks()}
 
-# 🔧 ADDED: This is what uvicorn looks for
-# The variable 'app' is already defined above, this just ensures it's exposed
-if __name__ == "__main__":
+# 🔧 REQUIRED: Explicit main() function for Hugging Face validator
+def main():
+    """Main entry point for the application."""
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=7860)
+
+# 🔧 REQUIRED: Guard that calls main()
+if __name__ == "__main__":
+    main()

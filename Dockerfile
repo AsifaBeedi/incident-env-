@@ -19,4 +19,5 @@ ENV HF_TOKEN=""
 
 EXPOSE 7860
 
+# 🔧 FIXED: Use uvicorn directly (no 'python app.py' after it)
 CMD ["uvicorn", "server.app:app", "--host", "0.0.0.0", "--port", "7860"]

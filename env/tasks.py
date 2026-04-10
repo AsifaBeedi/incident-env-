@@ -1,5 +1,6 @@
 """
-tasks.py — compatible with env.py exactly as written.
+tasks.py — Task definitions and shared reward engine.
+Compatible with env.py exactly as written.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from .models import (
     Metrics, RewardBreakdown, REMEDIATION_ACTIONS,
     ServiceState, ServiceStatus,
 )
+
 
 # ---------------------------------------------------------------------------
 # EpisodeContext
@@ -26,14 +28,17 @@ class EpisodeContext:
     partial_fixes:     dict[str, int]      = field(default_factory=dict)
     _action_pairs:     set[tuple]          = field(default_factory=set, repr=False)
 
+
 def _seen(ctx: EpisodeContext, atype: ActionType, target: str) -> bool:
+    """Register (action, target) pair. Returns True if already seen."""
     pair = (atype, target)
     already = pair in ctx._action_pairs
     ctx._action_pairs.add(pair)
     return already
 
+
 # ---------------------------------------------------------------------------
-# Reward engine - CRITICAL FIX
+# Reward engine
 # ---------------------------------------------------------------------------
 
 def reward_engine(
@@ -43,38 +48,44 @@ def reward_engine(
     step_count: int,
     max_steps: int,
 ) -> RewardBreakdown:
+    """
+    Apply universal penalty rules on top of task-computed RewardBreakdown.
+    Final reward is strictly clamped to (0.01, 0.99) — never 0.0 or 1.0.
+    """
     rb     = task_rb
     atype  = action.action_type
     target = (action.target or "").lower()
 
+    # Repeat penalty — only if this (action, target) was already used
     if _seen(ctx, atype, target):
-        rb.repeat = -0.08  # Changed from -0.1
+        rb.repeat = -0.08
 
+    # No-diagnosis penalty — only for remediation actions without prior diagnosis
     if atype in REMEDIATION_ACTIONS and ctx.diagnosis is None:
-        rb.no_diagnosis = -0.15  # Changed from -0.2
+        rb.no_diagnosis = -0.15
 
+    # NO_OP penalty
     if atype == ActionType.NO_OP:
-        rb.no_op = -0.03  # Changed from -0.05
+        rb.no_op = -0.03
 
+    # Budget bonus — small reward for correct early actions
     pre_clamp = (rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
                  + rb.harmful + rb.irrelevant)
-                 
     if pre_clamp > 0 and step_count <= max_steps // 2:
-        rb.budget_bonus = 0.03  # Changed from 0.05
+        rb.budget_bonus = 0.03
 
-    if step_count == 1:
-        rb.budget_bonus += 0.10  # Changed from 0.15
-
+    # Compute raw sum
     rb.raw = round(
         rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
         + rb.harmful + rb.irrelevant
         + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus,
         4,
     )
-    
-    # 🔥 CRITICAL FIX: Use 0.02 minimum and 0.98 maximum
-    rb.final = round(max(0.02, min(0.98, rb.raw)), 4)
+
+    # Clamp strictly to (0.01, 0.99) — validator requires strictly between 0 and 1
+    rb.final = round(max(0.01, min(0.99, rb.raw)), 4)
     return rb
+
 
 # ---------------------------------------------------------------------------
 # Task dataclass
@@ -95,8 +106,12 @@ class Task:
     true_root_cause: DiagnosisTag = DiagnosisTag.CRASH_LOOP
     true_fix_target: str          = ""
 
+
 # ===========================================================================
 # TASK 1 — EASY  auth-crash-loop
+# Root cause: auth-service crash loop (missing JWT_SECRET)
+# Red herring: db-proxy connection noise from auth reconnects
+# Correct seq: inspect_logs:auth-service → restart_service:auth-service[crash_loop]
 # ===========================================================================
 
 def _inject_auth_crash(services: list[ServiceState]) -> list[ServiceState]:
@@ -123,39 +138,42 @@ def _components_auth_crash(
     target = (action.target or "").lower()
     diag   = action.parameters.get("diagnosis")
 
+    # Diagnosis declaration
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
-        rb.diagnosis  = 0.15 if diag == DiagnosisTag.CRASH_LOOP else -0.08  # Changed
+        rb.diagnosis  = 0.15 if diag == DiagnosisTag.CRASH_LOOP else -0.08
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
-        rb.inspection = 0.15 if (target == "auth-service" and target not in ctx.inspected) \
-                        else (0.03 if target and target not in ctx.inspected else 0.0)  # Changed
+        if target == "auth-service" and target not in ctx.inspected:
+            rb.inspection = 0.15
+        elif target and target not in ctx.inspected:
+            rb.inspection = 0.03
         ctx.inspected.add(target)
         return rb, done
 
     if atype == ActionType.ACKNOWLEDGE:
-        rb.inspection = 0.0
         return rb, done
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "auth-service":
-            rb.fix, done = 0.25, True  # Changed from 0.20
+            rb.fix, done = 0.25, True
         else:
-            rb.irrelevant = -0.08  # Changed
+            rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     if atype in (ActionType.ROLLBACK, ActionType.CLEAR_CACHE):
-        rb.harmful = -0.15  # Changed
+        rb.harmful = -0.15
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.SCALE_UP:
-        rb.irrelevant = -0.08  # Changed
+        rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     return rb, done
+
 
 TASK_AUTH_CRASH = Task(
     id="auth-crash-loop",
@@ -169,8 +187,12 @@ TASK_AUTH_CRASH = Task(
     true_fix_target="auth-service",
 )
 
+
 # ===========================================================================
 # TASK 2 — MEDIUM  payments-oom-cascade
+# Root cause: payments-service OOM-killed
+# Red herring: api-gateway degraded (downstream effect), db-proxy slow queries
+# Correct seq: inspect payments → inspect/check gateway → restart payments[oom_kill]
 # ===========================================================================
 
 def _inject_payments_oom(services: list[ServiceState]) -> list[ServiceState]:
@@ -194,6 +216,7 @@ def _inject_payments_oom(services: list[ServiceState]) -> list[ServiceState]:
             svc.metrics.latency_ms = 850.0
     return services
 
+
 def _components_payments_oom(
     action: Action,
     services: list[ServiceState],
@@ -207,47 +230,47 @@ def _components_payments_oom(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.OOM_KILL:
-            rb.diagnosis = 0.15  # Changed
+            rb.diagnosis = 0.15
         elif diag == DiagnosisTag.UPSTREAM_TIMEOUT:
-            rb.diagnosis = -0.08  # Changed
+            rb.diagnosis = -0.08
         else:
-            rb.diagnosis = -0.15  # Changed
+            rb.diagnosis = -0.15
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "payments-service" and target not in ctx.inspected:
-            rb.inspection = 0.15  # Changed
+            rb.inspection = 0.15
         elif target == "api-gateway" and target not in ctx.inspected:
-            rb.inspection = 0.05  # Changed
+            rb.inspection = 0.05
         elif target and target not in ctx.inspected:
-            rb.inspection = 0.03  # Changed
+            rb.inspection = 0.03
         ctx.inspected.add(target)
         return rb, done
 
     if atype == ActionType.ACKNOWLEDGE:
-        rb.inspection = 0.0
         return rb, done
 
     if atype == ActionType.RESTART_SERVICE:
         if target == "payments-service":
-            rb.fix, done = 0.25, True  # Changed
+            rb.fix, done = 0.25, True
         elif target == "api-gateway":
-            rb.partial_fix = 0.05  # Changed
+            rb.partial_fix = 0.05
         else:
-            rb.irrelevant = -0.08  # Changed
+            rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.ROLLBACK:
-        rb.harmful = -0.15  # Changed
+        rb.harmful = -0.15
         ctx.remediation_count += 1
         return rb, done
 
     if atype in (ActionType.SCALE_UP, ActionType.CLEAR_CACHE):
-        rb.irrelevant = -0.08  # Changed
+        rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     return rb, done
+
 
 TASK_PAYMENTS_OOM = Task(
     id="payments-oom-cascade",
@@ -261,8 +284,12 @@ TASK_PAYMENTS_OOM = Task(
     true_fix_target="payments-service",
 )
 
+
 # ===========================================================================
 # TASK 3 — HARD  network-split-db-leak
+# Root cause: db-proxy WAL disk saturation from network partition
+# Red herrings: payments memory growth (not OOM), api-gateway version mismatch
+# Correct seq: inspect db-proxy → corroborate → clear_cache:db-proxy[resource_saturation]
 # ===========================================================================
 
 NETWORK_SPLIT_SIGNALS: dict[str, list[str]] = {
@@ -293,6 +320,7 @@ NETWORK_SPLIT_SIGNALS: dict[str, list[str]] = {
         "auth-service: INFO read replica shard healthy — no issues detected",
     ],
 }
+
 
 def _inject_network_split(services: list[ServiceState]) -> list[ServiceState]:
     from .models import ServiceState as S, ServiceStatus as SS
@@ -328,6 +356,7 @@ def _inject_network_split(services: list[ServiceState]) -> list[ServiceState]:
             svc.metrics.latency_ms   = 145.0
     return services
 
+
 def _components_network_split(
     action: Action,
     services: list[ServiceState],
@@ -341,62 +370,62 @@ def _components_network_split(
     if diag and not ctx.diagnosis:
         ctx.diagnosis = diag
         if diag == DiagnosisTag.RESOURCE_SATURATION:
-            rb.diagnosis = 0.15  # Changed
+            rb.diagnosis = 0.15
         elif diag in (DiagnosisTag.OOM_KILL, DiagnosisTag.BAD_DEPLOY):
-            rb.diagnosis = -0.08  # Changed
+            rb.diagnosis = -0.08
         else:
-            rb.diagnosis = -0.15  # Changed
+            rb.diagnosis = -0.15
 
     if atype in (ActionType.INSPECT_LOGS, ActionType.CHECK_METRICS):
         if target == "db-proxy" and target not in ctx.inspected:
-            rb.inspection = 0.15  # Changed
+            rb.inspection = 0.15
         elif target in ("api-gateway", "payments-service", "user-service") \
                 and target not in ctx.inspected:
-            rb.inspection = 0.03  # Changed
+            rb.inspection = 0.05
         elif target not in ctx.inspected:
-            rb.inspection = 0.02  # Changed
+            rb.inspection = 0.02
         ctx.inspected.add(target)
         return rb, done
 
     if atype == ActionType.ACKNOWLEDGE:
-        rb.inspection = 0.0
         return rb, done
 
     if atype == ActionType.CLEAR_CACHE:
         if target == "db-proxy":
-            db_inspected  = "db-proxy" in ctx.inspected
-            corroborated  = bool(ctx.inspected & {"api-gateway", "payments-service", "user-service"})
-            rb.fix        = 0.25 if (db_inspected and corroborated) else (0.18 if db_inspected else 0.08)  # Changed
-            done          = True
+            db_ok        = "db-proxy" in ctx.inspected
+            corroborated = bool(ctx.inspected & {"api-gateway", "payments-service", "user-service"})
+            rb.fix       = 0.25 if (db_ok and corroborated) else (0.18 if db_ok else 0.08)
+            done         = True
         else:
-            rb.irrelevant = -0.08  # Changed
+            rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.RESTART_SERVICE:
         if target in ("api-gateway", "payments-service", "user-service"):
             ctx.partial_fixes[target] = ctx.partial_fixes.get(target, 0) + 1
-            rb.partial_fix = 0.03  # Changed
+            rb.partial_fix = 0.03
         elif target == "db-proxy":
-            rb.partial_fix = 0.03  # Changed
+            rb.partial_fix = 0.03
         elif target == "auth-service":
-            rb.harmful = -0.15  # Changed
+            rb.harmful = -0.15
         else:
-            rb.irrelevant = -0.08  # Changed
+            rb.irrelevant = -0.08
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.SCALE_UP:
-        rb.partial_fix = 0.02 if target == "db-proxy" else 0.0  # Changed
+        rb.partial_fix = 0.02 if target == "db-proxy" else 0.0
         ctx.remediation_count += 1
         return rb, done
 
     if atype == ActionType.ROLLBACK:
-        rb.harmful = -0.15  # Changed
+        rb.harmful = -0.15
         ctx.remediation_count += 1
         return rb, done
 
     return rb, done
+
 
 TASK_NETWORK_SPLIT = Task(
     id="network-split-db-leak",
@@ -410,6 +439,7 @@ TASK_NETWORK_SPLIT = Task(
     true_fix_target="db-proxy",
 )
 
+
 # ===========================================================================
 # Registry + loader
 # ===========================================================================
@@ -420,14 +450,16 @@ TASK_REGISTRY: dict[str, Task] = {
     TASK_NETWORK_SPLIT.id: TASK_NETWORK_SPLIT,
 }
 
+
 def load_task(task_id: str) -> Task:
     if task_id not in TASK_REGISTRY:
         available = ", ".join(f"{t.id!r} ({t.difficulty})" for t in TASK_REGISTRY.values())
         raise ValueError(f"Unknown task {task_id!r}. Available: {available}")
     return TASK_REGISTRY[task_id]
 
+
 def list_tasks() -> list[dict]:
     return [
         {"id": t.id, "name": t.name, "difficulty": t.difficulty, "max_steps": t.max_steps}
         for t in TASK_REGISTRY.values()
-        ]
+    ]

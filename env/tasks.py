@@ -1,6 +1,9 @@
 """
 tasks.py — Task definitions and shared reward engine.
 Compatible with env.py exactly as written.
+
+KEY FIX: reward_engine always sets rb.final to a value strictly in (0.01, 0.99).
+The raw field is also clamped. Individual component fields remain as raw deltas.
 """
 
 from __future__ import annotations
@@ -50,7 +53,10 @@ def reward_engine(
 ) -> RewardBreakdown:
     """
     Apply universal penalty rules on top of task-computed RewardBreakdown.
-    Final reward is strictly clamped to (0.01, 0.99) — never 0.0 or 1.0.
+
+    GUARANTEE: rb.final is ALWAYS strictly in (0.01, 0.99).
+               rb.raw is ALWAYS strictly in (0.01, 0.99).
+               Neither can be exactly 0.0 or exactly 1.0.
     """
     rb     = task_rb
     atype  = action.action_type
@@ -75,15 +81,23 @@ def reward_engine(
         rb.budget_bonus = 0.03
 
     # Compute raw sum
-    rb.raw = round(
+    raw_sum = round(
         rb.inspection + rb.diagnosis + rb.fix + rb.partial_fix
         + rb.harmful + rb.irrelevant
         + rb.repeat + rb.no_diagnosis + rb.no_op + rb.budget_bonus,
         4,
     )
 
-    # Clamp strictly to (0.01, 0.99) — validator requires strictly between 0 and 1
-    rb.final = round(max(0.01, min(0.99, rb.raw)), 4)
+    # Clamp raw strictly to (0.01, 0.99)
+    rb.raw = round(max(0.01, min(0.99, raw_sum)), 4)
+
+    # Clamp final strictly to (0.01, 0.99) — validator requires strictly between 0 and 1
+    rb.final = round(max(0.01, min(0.99, raw_sum)), 4)
+
+    # Belt-and-suspenders: assert invariant is maintained
+    assert 0.0 < rb.final < 1.0, f"rb.final={rb.final} violates (0,1) invariant"
+    assert 0.0 < rb.raw < 1.0, f"rb.raw={rb.raw} violates (0,1) invariant"
+
     return rb
 
 

@@ -1,10 +1,8 @@
 """
 models.py — Pydantic data contracts for the AI Incident Response OpenEnv environment.
-
 OpenEnv return signature
 ------------------------
     obs, reward, done, info = env.step(action)
-
     observation : Observation
     reward      : float              strictly in (0.0, 1.0)
     done        : bool
@@ -116,24 +114,26 @@ class Action(BaseModel):
 
 # ---------------------------------------------------------------------------
 # RewardBreakdown
-# ALL defaults are 0.0 — only the fields actually set by task/engine matter.
-# Non-zero defaults were the root cause of corrupted reward signals.
+# ALL component defaults are 0.0.
+# IMPORTANT: Only rb.final and rb.raw are guaranteed to be in (0.01, 0.99).
+# Individual components may be 0.0 by design (they represent additive deltas).
+# The validator must only check rb.final and rb.raw, not individual components.
 # ---------------------------------------------------------------------------
 
 class RewardBreakdown(BaseModel):
-    # Task-logic components
+    # Task-logic components (additive deltas, may be 0.0)
     inspection:   float = 0.0
     diagnosis:    float = 0.0
     fix:          float = 0.0
     partial_fix:  float = 0.0
     harmful:      float = 0.0
     irrelevant:   float = 0.0
-    # Engine penalty components
+    # Engine penalty components (may be 0.0)
     repeat:       float = 0.0
     no_diagnosis: float = 0.0
     no_op:        float = 0.0
-    # Engine bonus
+    # Engine bonus (may be 0.0)
     budget_bonus: float = 0.0
-    # Totals — computed by reward_engine, never set manually
-    raw:          float = 0.0
-    final:        float = 0.0
+    # Totals — ALWAYS strictly in (0.01, 0.99), computed by reward_engine
+    raw:          float = 0.01
+    final:        float = 0.01

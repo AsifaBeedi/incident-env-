@@ -23,6 +23,10 @@ SEED     = 42
 
 _CLIENT = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
 
+# Score bounds — strictly within (0.0, 1.0) exclusive
+_SCORE_MIN = 0.02
+_SCORE_MAX = 0.98
+
 # ---------------- VALID VALUES ----------------
 _VALID_ACTION_TYPES = [a.value for a in ActionType]
 _VALID_DIAGNOSES    = [d.value for d in DiagnosisTag]
@@ -38,6 +42,44 @@ Rules:
 - Never fix without a prior diagnosis
 Return ONLY a JSON object like:
 {{"action_type": "inspect_logs", "target": "auth-service", "parameters": {{}}}}"""
+
+
+# ---------------- SCORE HELPERS ----------------
+
+def _clamp_score(v: float) -> float:
+    """Clamp a score strictly into (_SCORE_MIN, _SCORE_MAX)."""
+    if v != v or v == float("inf") or v == float("-inf"):  # NaN / Inf
+        return _SCORE_MIN
+    if v <= 0.0:
+        return _SCORE_MIN
+    if v >= 1.0:
+        return _SCORE_MAX
+    return round(max(_SCORE_MIN, min(_SCORE_MAX, v)), 4)
+
+
+def _compute_episode_score(rewards: list[float], info: dict, solved: bool, max_steps: int) -> float:
+    """
+    Compute a single normalized task score strictly in (0.0, 1.0).
+
+    Strategy: Use cumulative_reward from info if available (it's already
+    clamped by the env). Fall back to mean of per-step rewards.
+    This ensures the task score is always in (_SCORE_MIN, _SCORE_MAX).
+    """
+    # Prefer cumulative_reward from last info dict — already clamped by env
+    cumulative = info.get("cumulative_reward")
+    if cumulative is not None:
+        try:
+            return _clamp_score(float(cumulative))
+        except (TypeError, ValueError):
+            pass
+
+    # Fall back: mean of per-step rewards (each already in [0.01, 0.99])
+    if rewards:
+        mean_reward = sum(rewards) / len(rewards)
+        return _clamp_score(mean_reward)
+
+    # Last resort
+    return _SCORE_MIN
 
 
 # ---------------- OBS ----------------
@@ -110,6 +152,8 @@ def _run_episode(task_id: str) -> None:
     step:         int         = 0
     solved:       bool        = False
     seen_actions: set         = set()
+    last_info:    dict        = {}
+    max_steps:    int         = 6  # default, updated from task_meta
     env = None
 
     try:
@@ -132,8 +176,13 @@ def _run_episode(task_id: str) -> None:
                 seen_actions.add(action_key)
 
             obs, reward, done, info = env.step(action)
+
+            # Clamp per-step reward — strictly in (0.0, 1.0)
+            reward = _clamp_score(reward)
+
             step += 1
             rewards.append(reward)
+            last_info = info
 
             if done and info.get("task_solved") is True:
                 solved = True
@@ -151,7 +200,7 @@ def _run_episode(task_id: str) -> None:
 
             print(
                 f"[STEP] step={step} action={action_str} "
-                f"reward={reward:.2f} done={'true' if done else 'false'} "
+                f"reward={reward:.4f} done={'true' if done else 'false'} "
                 f"error={error_str}",
                 flush=True,
             )
@@ -170,12 +219,13 @@ def _run_episode(task_id: str) -> None:
 
     except Exception as exc:
         error_line = str(exc).replace("\n", " ").strip()
+        fallback_reward = _clamp_score(0.05)
         print(
             f"[STEP] step={step + 1} action=no_op "
-            f"reward=0.05 done=false error={error_line}",
+            f"reward={fallback_reward:.4f} done=false error={error_line}",
             flush=True,
         )
-        rewards.append(0.05)
+        rewards.append(fallback_reward)
         step += 1
 
     finally:
@@ -183,13 +233,19 @@ def _run_episode(task_id: str) -> None:
             env.close()
 
         if not rewards:
-            rewards = [0.05]
+            rewards = [_clamp_score(0.05)]
             step    = 1
 
-        rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+        # Compute normalized episode score strictly in (0.0, 1.0)
+        # This is the value the validator uses as the "task score"
+        episode_score = _compute_episode_score(rewards, last_info, solved, max_steps)
+
+        # Per-step rewards formatted individually (each already clamped)
+        rewards_str = ",".join(f"{r:.4f}" for r in rewards)
+
         print(
             f"[END] success={'true' if solved else 'false'} steps={step} "
-            f"rewards={rewards_str}",
+            f"score={episode_score:.4f} rewards={rewards_str}",
             flush=True,
         )
 
